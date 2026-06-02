@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -1268,14 +1269,14 @@ class ActiveHwpReader(BasePollingReader):
         try:
             import win32com.client as win32
             from ctypes import POINTER, byref, c_long, c_void_p
-            from ctypes.wintypes import HWND, HRESULT
+            from ctypes.wintypes import HWND
 
             oleacc = ctypes.oledll.oleacc
             iid_buffer = ctypes.create_string_buffer(bytes(pythoncom.IID_IDispatch))
             pdisp = c_void_p()
             accessible_object_from_window = oleacc.AccessibleObjectFromWindow
             accessible_object_from_window.argtypes = [HWND, c_long, c_void_p, POINTER(c_void_p)]
-            accessible_object_from_window.restype = HRESULT
+            accessible_object_from_window.restype = c_long
             result = accessible_object_from_window(
                 HWND(hwnd),
                 c_long(-16),  # OBJID_NATIVEOM
@@ -1316,6 +1317,10 @@ class ActiveHwpReader(BasePollingReader):
             candidates.append(win32.Dispatch(obj))
         except Exception:
             pass
+        try:
+            candidates.append(win32.dynamic.Dispatch(obj))
+        except Exception:
+            pass
 
         for source in (obj, getattr(obj, "_oleobj_", None)):
             if source is None:
@@ -1326,6 +1331,10 @@ class ActiveHwpReader(BasePollingReader):
             for iid in self._hwp_query_interface_iids():
                 try:
                     candidates.append(win32.Dispatch(query(iid)))
+                except Exception:
+                    pass
+                try:
+                    candidates.append(win32.dynamic.Dispatch(query(iid)))
                 except Exception:
                     pass
 
@@ -1372,13 +1381,18 @@ class ActiveHwpReader(BasePollingReader):
                 return ""
             self._log_hwp_window(hwnd)
             hwp = self._active_hwp()
-            text = self._scan_text(hwp) if hwp is not None else ""
+            text = self._read_hwp_selected_plain_text(hwp) if hwp is not None else ""
             if has_text_content(text):
                 self._last_read_method = "com"
                 self._last_uia_source = ""
                 self._last_hwp_text = text
                 self._last_hwp_style_info = self._read_hwp_style_info(hwp)
                 return text
+            if hwp is not None:
+                self._last_hwp_text = ""
+                self._last_hwp_style_info = {}
+                self._last_read_method = ""
+                return ""
             text = self._read_text_via_uia(hwnd)
             if has_text_content(text):
                 self._last_read_method = "uia"
@@ -1408,6 +1422,21 @@ class ActiveHwpReader(BasePollingReader):
             "_source_text": self._last_hwp_text if self._last_read_method == "com" else "",
         })
         return style_info
+
+    def _read_hwp_selected_plain_text(self, hwp) -> str:
+        getter = getattr(hwp, "GetTextFile", None)
+        if not callable(getter):
+            return ""
+        for option in ("saveblock",):
+            try:
+                text = normalize_text(str(getter("TEXT", option) or "")).strip()
+            except Exception as exc:
+                self._log_hwp(f"HWP selected TEXT read failed option={option!r}: {type(exc).__name__}: {exc}")
+                continue
+            if has_text_content(text):
+                self._log_hwp(f"HWP selected TEXT option={option!r} length={len(text)} preview={text[:120]!r}")
+                return text
+        return ""
 
     def _scan_text(self, hwp) -> str:
         for range_option in self.SCAN_RANGE_OPTIONS:
@@ -1492,11 +1521,43 @@ class ActiveHwpReader(BasePollingReader):
             "underline_color": self._hwp_attr(char_shape, "UnderlineColor"),
         }
         clean_style = {key: value for key, value in style_info.items() if value is not None}
+        selection_pos = self._read_hwp_selection_position(hwp)
+        if selection_pos:
+            clean_style["hwp_selection_pos"] = selection_pos
         clean_style["hwp_style_scope"] = "basic" if (
             clean_style.get("font_name") and clean_style.get("font_size") is not None
         ) else "mixed_or_unknown"
         self._log_hwp(f"HWP CharShape style={clean_style!r}")
         return clean_style
+
+    def _read_hwp_selection_position(self, hwp) -> dict:
+        getter = getattr(hwp, "GetSelectedPos", None)
+        if not callable(getter):
+            return {}
+        try:
+            value = getter()
+        except Exception as exc:
+            self._log_hwp(f"HWP GetSelectedPos failed: {type(exc).__name__}: {exc}")
+            return {}
+        parsed = self._parse_hwp_selected_pos(value)
+        self._log_hwp(f"HWP GetSelectedPos value={value!r} parsed={parsed!r}")
+        return parsed
+
+    def _parse_hwp_selected_pos(self, value) -> dict:
+        if not isinstance(value, tuple) or len(value) < 7 or not bool(value[0]):
+            return {}
+        try:
+            return {
+                "start_list": int(value[1]),
+                "start_para": int(value[2]),
+                "start_pos": int(value[3]),
+                "end_list": int(value[4]),
+                "end_para": int(value[5]),
+                "end_pos": int(value[6]),
+                "raw": [item for item in value],
+            }
+        except Exception:
+            return {"raw": [item for item in value]}
 
     def _read_hwp_style_segments(self, hwp, text: str) -> list[dict]:
         if len(text) > self.MAX_HWP_STYLE_SEGMENT_CHARS:
@@ -1659,9 +1720,43 @@ class ActiveHwpReader(BasePollingReader):
         self._log_uia_candidates(hwnd, filtered or candidates)
         if not filtered:
             return ""
+        combined_text = self._combine_hwp_uia_text_candidates(filtered)
+        if combined_text:
+            self._last_uia_source = "combined_uia"
+            return combined_text
         source_name, _control_type, _title, text = max(filtered, key=lambda item: len(item[3]))
         self._last_uia_source = source_name
         return text
+
+    def _combine_hwp_uia_text_candidates(self, candidates: list[tuple[str, str, str, str]]) -> str:
+        leaf_rows = [
+            (source_name, text)
+            for source_name, control_type, _title, text in candidates
+            if source_name.startswith("descendant-") and control_type in {"Edit", "Text"}
+        ]
+        if len(leaf_rows) < 2:
+            return ""
+        lines: list[str] = []
+        seen: set[str] = set()
+        for _source_name, text in leaf_rows:
+            normalized = normalize_text(text).strip()
+            if not normalized or normalized in seen or self._is_hwp_uia_noise_line(normalized):
+                continue
+            seen.add(normalized)
+            lines.append(normalized)
+        return "\n".join(lines)
+
+    def _is_hwp_uia_noise_line(self, text: str) -> bool:
+        value = normalize_text(text).strip()
+        if not value:
+            return True
+        if value.upper() in {"CAPS", "NUM", "SCRL"}:
+            return True
+        if re.fullmatch(r"바탕글(?:\s+사본\d*)?", value):
+            return True
+        if value in {"굴림", "돋움", "바탕", "궁서", "함초롬바탕", "함초롬돋움", "한컴바탕"}:
+            return True
+        return False
 
     def _uia_candidate_wrappers(self, hwnd: int) -> list[tuple[str, object]]:
         wrappers: list[tuple[str, object]] = []

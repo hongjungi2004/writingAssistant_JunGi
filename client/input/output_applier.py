@@ -1,11 +1,24 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ctypes
+import html
+import os
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 import time
+import zipfile
+import shutil
 
 import pyperclip
+
+from client.input.hwpx_document import (
+    create_hwpx_fragment_from_match,
+    extract_hwpx_text,
+    find_hwpx_text_matches,
+    has_hwpx_position_fallback_match,
+)
+from client.input.hwpml_document import create_hwpml_fragment_from_selection, extract_hwpml_text
 
 try:
     import pythoncom
@@ -117,36 +130,18 @@ class OutputApplier:
             try:
                 self._apply_to_active_hwp(text, target.style_info, target.window_handle)
                 self._log_hwp_replace(
-                    f"applied via COM length={len(text)} "
+                    f"applied via HWPX COM length={len(text)} "
                     f"read_method={(target.style_info or {}).get('read_method')!r} "
                     f"style_keys={sorted((target.style_info or {}).keys())!r}"
                 )
                 return
             except Exception as com_exc:
-                self._log_hwp_replace(f"COM apply failed: {type(com_exc).__name__}: {com_exc}")
-                try:
-                    self._apply_to_hwp_via_uia(target.window_handle, text)
-                    self._log_hwp_replace(
-                        f"applied via UIA length={len(text)} read_method={(target.style_info or {}).get('read_method')!r}"
-                    )
-                    return
-                except Exception as uia_exc:
-                    self._log_hwp_replace(f"UIA apply failed: {type(uia_exc).__name__}: {uia_exc}")
-                    try:
-                        self._apply_to_hwp_via_keyboard_once(target.window_handle, text)
-                        self._log_hwp_replace(
-                            f"applied via one-shot keyboard length={len(text)} "
-                            f"read_method={(target.style_info or {}).get('read_method')!r}"
-                        )
-                        return
-                    except Exception as keyboard_exc:
-                        self._log_hwp_replace(
-                            f"keyboard apply failed: {type(keyboard_exc).__name__}: {keyboard_exc}"
-                        )
-                        raise RuntimeError(
-                            "HWP replacement failed. "
-                            f"COM: {com_exc}; UIA: {uia_exc}; keyboard: {keyboard_exc}"
-                        ) from keyboard_exc
+                self._log_hwp_replace(f"HWPX COM apply failed: {type(com_exc).__name__}: {com_exc}")
+                raise RuntimeError(
+                    "HWP rich-format replacement failed. "
+                    "Plain-text fallback was skipped to avoid losing formatting. "
+                    f"Detail: {com_exc}"
+                ) from com_exc
 
         self._apply_via_window_handle(target.window_handle, text)
 
@@ -486,6 +481,8 @@ class OutputApplier:
         if hwp is None:
             raise RuntimeError("No active HWP COM object is available.")
         style_info = dict(style_info or {})
+        self._apply_to_hwp_hwpx_selection(hwp, text, style_info)
+        return
         source_hwpml2x = ""
         if style_info.get("hwp_style_scope") == "mixed_or_unknown" and not style_info.get("segments"):
             self._diagnose_hwp_textfile_formats(hwp)
@@ -503,6 +500,898 @@ class OutputApplier:
         hwp_style_info = dict(style_info)
         hwp_style_info["_replacement_text"] = text
         self._apply_hwp_style(hwp, hwp_style_info)
+
+    def _apply_to_hwp_hwpx_selection(self, hwp, replacement_text: str, style_info: dict) -> bool:
+        full_source_text = str(style_info.get("_source_text") or "").strip()
+        source_text = full_source_text
+        live_selection = self._read_hwp_selection_plain_text(hwp)
+        if live_selection:
+            source_text = live_selection
+        if not source_text:
+            raise RuntimeError("한글에서 드래그 선택된 원문을 찾지 못했습니다.")
+        replacement_text = self._hwp_replacement_for_live_selection(
+            full_source_text=full_source_text,
+            full_replacement_text=replacement_text,
+            selected_source_text=source_text,
+        )
+        work_dir = _LOG_DIR / "hwp_hwpx_blocks" / time.strftime("%Y%m%d_%H%M%S")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        document_path = work_dir / "document.hwpx"
+        try:
+            if self._apply_to_hwp_hwpml_selection(hwp, replacement_text, work_dir):
+                return True
+            live_selection_pos = self._read_hwp_selection_position(hwp)
+            if live_selection_pos:
+                style_info["hwp_selection_pos"] = live_selection_pos
+            self._current_hwp_selection_pos = style_info.get("hwp_selection_pos") or {}
+            try:
+                saved = self._save_hwp_document_as_hwpx(
+                    hwp,
+                    document_path,
+                    expected_text=source_text,
+                    prefer_full_document=bool(style_info.get("hwp_selection_pos")),
+                )
+            finally:
+                self._current_hwp_selection_pos = {}
+            if not saved:
+                raise RuntimeError("Could not save active HWP document as HWPX.")
+            document_text = extract_hwpx_text(document_path).strip()
+            dump_dir = self._dump_hwp_selection_debug(
+                hwp=hwp,
+                document_path=document_path,
+                raw_source_text=str(style_info.get("_source_text") or ""),
+                live_selection_text=live_selection,
+                extracted_hwpx_text=document_text,
+                replacement_text=replacement_text,
+                work_dir=work_dir,
+                selection_pos=style_info.get("hwp_selection_pos") or {},
+            )
+            source_text = self._source_for_saved_hwpx_document(source_text, document_text)
+            self._log_hwp_replace(
+                f"HWPX document text length={len(document_text)} "
+                f"source_len={len(source_text)} preview={document_text[:120]!r} dump_dir={dump_dir!s}"
+            )
+            fragment_specs = self._hwp_hwpx_fragment_specs(
+                style_info=style_info,
+                source_text=source_text,
+                replacement_text=replacement_text,
+            )
+            fragment_paths = self._create_hwp_hwpx_fragments(
+                document_path=document_path,
+                work_dir=work_dir,
+                document_text=document_text,
+                selection_pos=style_info.get("hwp_selection_pos") or {},
+                fragment_specs=fragment_specs,
+            )
+            for fragment_path in fragment_paths:
+                self._dump_hwp_fragment_debug(fragment_path, dump_dir)
+            self._replace_hwp_selection_with_fragments(hwp, fragment_paths)
+            self._log_hwp_replace(
+                "HWPX fragment apply succeeded "
+                f"count={len(fragment_paths)} fragments={[str(path) for path in fragment_paths]!r}"
+            )
+            return True
+        except Exception as exc:
+            self._log_hwp_replace(f"HWPX selection apply failed: {type(exc).__name__}: {exc}")
+            raise
+
+    def _apply_to_hwp_hwpml_selection(self, hwp, replacement_text: str, work_dir: Path) -> bool:
+        if not self._hwp_hwpml2x_enabled():
+            self._log_hwp_replace("HWPML2X apply skipped by env")
+            return False
+        getter = getattr(hwp, "GetTextFile", None)
+        if not callable(getter):
+            self._log_hwp_replace("HWPML2X apply skipped: GetTextFile unavailable")
+            return False
+        try:
+            hwpml = str(getter("HWPML2X", "saveblock") or "")
+            if not hwpml.strip():
+                self._log_hwp_replace("HWPML2X apply skipped: empty saveblock")
+                return False
+            source_path = work_dir / "selection.hml"
+            fragment_path = work_dir / "selection.modified.hml"
+            source_path.write_text(hwpml, encoding="utf-8")
+            result = create_hwpml_fragment_from_selection(source_path, replacement_text, fragment_path)
+            fragment_text = extract_hwpml_text(fragment_path).strip()
+            self._log_hwp_replace(
+                "HWPML2X fragment prepared "
+                f"char_count={result.char_count} source_len={len(result.original_text)} "
+                f"replacement_len={len(result.replacement_text)} fragment_len={len(fragment_text)} "
+                f"path={fragment_path!s}"
+            )
+            if not fragment_text:
+                raise RuntimeError("HWPML2X fragment text is empty.")
+            self._delete_hwp_selection(hwp)
+            if not self._insert_hwpml_file(hwp, fragment_path):
+                raise RuntimeError("HWPML2X InsertFile failed.")
+            self._log_hwp_replace(f"HWPML2X fragment apply succeeded path={fragment_path!s}")
+            return True
+        except Exception as exc:
+            self._log_hwp_replace(f"HWPML2X apply failed; falling back to HWPX SaveAs: {type(exc).__name__}: {exc}")
+            return False
+
+    def _hwp_hwpml2x_enabled(self) -> bool:
+        value = str(os.environ.get("WA_HWP_USE_HWPML2X", "")).strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _hwp_hwpx_fragment_specs(
+        self,
+        style_info: dict,
+        source_text: str,
+        replacement_text: str,
+    ) -> list[dict[str, str]]:
+        raw_items = (
+            style_info.get("hwp_hwpx_fragments")
+            or style_info.get("hwpx_fragments")
+            or style_info.get("replacement_fragments")
+            or []
+        )
+        specs: list[dict[str, str]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                item_source = str(item.get("source_text") or item.get("source") or "").strip()
+                item_replacement = str(
+                    item.get("replacement_text")
+                    or item.get("replacement")
+                    or item.get("text")
+                    or ""
+                ).strip()
+                if item_source and item_replacement:
+                    specs.append({"source_text": item_source, "replacement_text": item_replacement})
+        if specs:
+            self._log_hwp_replace(f"HWPX multi-fragment specs count={len(specs)}")
+            return specs
+        return [{"source_text": source_text, "replacement_text": replacement_text}]
+
+    def _create_hwp_hwpx_fragments(
+        self,
+        document_path: Path,
+        work_dir: Path,
+        document_text: str,
+        selection_pos: dict,
+        fragment_specs: list[dict[str, str]],
+    ) -> list[Path]:
+        use_rebuilder = self._hwp_experimental_rebuilder_enabled()
+        self._log_hwp_replace(f"HWP experimental Word-like HWPX rebuilder enabled={use_rebuilder}")
+        fragment_paths: list[Path] = []
+        for index, spec in enumerate(fragment_specs):
+            fragment_path = work_dir / f"fragment.{index:03d}.modified.hwpx"
+            source_text = spec["source_text"]
+            replacement_text = spec["replacement_text"]
+            preferred_start_paragraph = self._hwp_selection_start_paragraph(selection_pos)
+            preferred_start_offset = self._hwp_selection_start_offset(selection_pos)
+            preferred_end_paragraph = self._hwp_selection_end_paragraph(selection_pos)
+            preferred_end_offset = self._hwp_selection_end_offset(selection_pos)
+            matches = self._hwp_hwpx_matches(document_path, source_text)
+            use_position_fallback = (
+                preferred_start_paragraph is not None
+                and not matches
+                and self._hwp_position_fallback_available(document_path, source_text, selection_pos)
+            )
+            use_positioned_match = (
+                preferred_start_paragraph is not None
+                and len(matches) > 1
+                and self._hwp_positioned_matches_count(
+                    matches,
+                    preferred_start_paragraph,
+                    preferred_start_offset,
+                ) == 1
+            )
+            self._write_hwp_hwpx_match_debug(
+                work_dir=work_dir,
+                index=index,
+                source_text=source_text,
+                matches=matches,
+                preferred_start_paragraph=preferred_start_paragraph,
+                preferred_start_offset=preferred_start_offset,
+                use_positioned_match=use_positioned_match,
+            )
+            if use_rebuilder and not use_positioned_match and not use_position_fallback:
+                from _tmp_hwp_word_like.hwpx_rebuilder import create_rebuilt_hwpx_fragment
+
+                create_rebuilt_hwpx_fragment(
+                    document_path=document_path,
+                    source_text=source_text,
+                    replacement_text=replacement_text,
+                    output_path=fragment_path,
+                )
+            else:
+                create_hwpx_fragment_from_match(
+                    document_path,
+                    source_text,
+                    replacement_text,
+                    fragment_path,
+                    preferred_start_paragraph=preferred_start_paragraph,
+                    preferred_start_offset=preferred_start_offset,
+                    preferred_end_paragraph=preferred_end_paragraph,
+                    preferred_end_offset=preferred_end_offset,
+                )
+            fragment_text = extract_hwpx_text(fragment_path).strip()
+            self._validate_hwp_fragment_scope(
+                fragment_text=fragment_text,
+                document_text=document_text,
+                source_text=source_text,
+                replacement_text=replacement_text,
+            )
+            fragment_paths.append(fragment_path)
+        return fragment_paths
+
+    def _replace_hwp_selection_with_fragments(self, hwp, fragment_paths: list[Path]) -> None:
+        if not fragment_paths:
+            raise RuntimeError("No HWPX fragments were created.")
+        self._delete_hwp_selection(hwp)
+        for index, fragment_path in enumerate(fragment_paths):
+            if not self._insert_hwpx_file(hwp, fragment_path):
+                raise RuntimeError(f"InsertFile action failed for fragment {index}.")
+            self._log_hwp_replace(f"HWPX fragment inserted index={index} path={fragment_path!s}")
+
+    def _validate_hwp_fragment_scope(
+        self,
+        fragment_text: str,
+        document_text: str,
+        source_text: str,
+        replacement_text: str,
+    ) -> None:
+        """Prevent deleting the selection and inserting a full-document HWPX."""
+        fragment_key = self._hwp_compare_key(fragment_text)
+        document_key = self._hwp_compare_key(document_text)
+        source_key = self._hwp_compare_key(source_text)
+        replacement_key = self._hwp_compare_key(replacement_text)
+        intended_len = max(len(source_key), len(replacement_key), 1)
+        self._log_hwp_replace(
+            "HWP fragment scope check "
+            f"fragment_key_len={len(fragment_key)} document_key_len={len(document_key)} "
+            f"source_key_len={len(source_key)} replacement_key_len={len(replacement_key)}"
+        )
+        if not fragment_key:
+            raise RuntimeError("삽입할 HWPX 조각이 비어 있습니다.")
+        if len(document_key) > intended_len + 80 and len(fragment_key) > intended_len * 2 + 80:
+            raise RuntimeError(
+                "삽입용 HWPX가 선택 영역보다 지나치게 큽니다. "
+                "전체 문서가 fragment로 들어가는 것을 차단했습니다."
+            )
+
+
+
+    def _hwp_replacement_for_live_selection(
+        self,
+        full_source_text: str,
+        full_replacement_text: str,
+        selected_source_text: str,
+    ) -> str:
+        """Return only the corrected text for the current HWP selection.
+
+        The UI can hold the correction for the whole detected document, while HWP
+        SaveBlock targets only the currently dragged selection. Without this crop,
+        InsertFile replaces the selection with the whole corrected document.
+        """
+        full_source = self._normalize_hwp_source_text(full_source_text or "")
+        full_replacement = self._normalize_hwp_source_text(full_replacement_text or "")
+        selected = self._normalize_hwp_source_text(selected_source_text or "")
+        if not full_replacement or not selected:
+            return full_replacement
+        if self._compare_hwp_text_lenient(full_replacement, selected):
+            return full_replacement
+        if not full_source or self._compare_hwp_text_lenient(full_source, selected):
+            return full_replacement
+        if len(self._hwp_compare_key(full_replacement)) <= len(self._hwp_compare_key(selected)) + 10:
+            return full_replacement
+        try:
+            source_start, source_end = self._find_selection_span_in_source(full_source, selected)
+            if source_start is None or source_end is None:
+                self._log_hwp_replace("HWP selection crop skipped: selected text span not found in full source")
+                return full_replacement
+            repl_start = self._map_text_index(full_source, full_replacement, source_start)
+            repl_end = self._map_text_index(full_source, full_replacement, source_end)
+            cropped = full_replacement[repl_start:repl_end].strip()
+            if cropped:
+                self._log_hwp_replace(
+                    "HWP selection crop applied "
+                    f"full_replacement_len={len(full_replacement)} selected_len={len(selected)} cropped_len={len(cropped)}"
+                )
+                return cropped
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP selection crop failed: {type(exc).__name__}: {exc}")
+        return full_replacement
+
+    def _find_selection_span_in_source(self, full_source: str, selected: str) -> tuple[int | None, int | None]:
+        full_key, full_map = self._hwp_key_with_index_map(full_source)
+        selected_key, _ = self._hwp_key_with_index_map(selected)
+        if not full_key or not selected_key:
+            return None, None
+        pos = full_key.find(selected_key)
+        if pos < 0:
+            return None, None
+        start = full_map[pos]
+        end = full_map[pos + len(selected_key) - 1] + 1
+        return start, end
+
+    def _hwp_key_with_index_map(self, text: str) -> tuple[str, list[int]]:
+        key_chars: list[str] = []
+        index_map: list[int] = []
+        for index, char in enumerate(self._normalize_hwp_source_text(text)):
+            if char.isspace():
+                continue
+            # HWP GetTextFile may include visual/debug backtick near soft breaks.
+            if char == "`":
+                continue
+            key_chars.append(char)
+            index_map.append(index)
+        return "".join(key_chars), index_map
+
+    def _hwp_compare_key(self, text: str) -> str:
+        return self._hwp_key_with_index_map(text)[0]
+
+    def _compare_hwp_text_lenient(self, left: str, right: str) -> bool:
+        left_key = self._hwp_compare_key(left)
+        right_key = self._hwp_compare_key(right)
+        if not left_key or not right_key:
+            return False
+        return left_key == right_key
+
+    def _map_text_index(self, source: str, replacement: str, source_index: int) -> int:
+        import difflib
+
+        matcher = difflib.SequenceMatcher(None, source, replacement, autojunk=False)
+        previous_j = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if source_index < i1:
+                return previous_j
+            if source_index == i1:
+                return j1
+            if i1 < source_index < i2:
+                if tag == "equal":
+                    return j1 + (source_index - i1)
+                if tag == "replace":
+                    span = max(1, i2 - i1)
+                    return j1 + round((j2 - j1) * (source_index - i1) / span)
+                return j1
+            if source_index == i2:
+                return j2
+            previous_j = j2
+        return len(replacement)
+
+    def _hwp_experimental_rebuilder_enabled(self) -> bool:
+        """Enable the reversible HWPX rebuilder by default when its temp module exists.
+
+        Set WA_HWP_EXPERIMENTAL_REBUILDER=0 to force the old matcher.
+        This avoids silent non-use when the user forgets to set the env var.
+        """
+        value = str(os.environ.get("WA_HWP_EXPERIMENTAL_REBUILDER", "")).strip().lower()
+        if value in {"0", "false", "no", "off"}:
+            return False
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        try:
+            import importlib.util
+            return importlib.util.find_spec("_tmp_hwp_word_like.hwpx_rebuilder") is not None
+        except Exception:
+            return False
+
+    def _dump_hwp_fragment_debug(self, fragment_path: Path, dump_dir: Path) -> None:
+        """Copy the exact HWPX fragment that will be inserted for post-failure inspection."""
+        try:
+            fragment_dump = dump_dir / "fragment_modified_inserted.hwpx"
+            shutil.copy2(fragment_path, fragment_dump)
+            latest_dir = _LOG_DIR / "selected_block_dump" / "latest"
+            if latest_dir.exists():
+                shutil.copy2(fragment_path, latest_dir / "fragment_modified_inserted.hwpx")
+            with zipfile.ZipFile(fragment_path, "r") as archive:
+                for name in archive.namelist():
+                    lower = name.lower()
+                    if lower.startswith("contents/section") and lower.endswith(".xml"):
+                        safe_name = "fragment_" + name.replace("/", "_").replace("\\", "_")
+                        data = archive.read(name)
+                        (dump_dir / safe_name).write_bytes(data)
+                        if latest_dir.exists():
+                            (latest_dir / safe_name).write_bytes(data)
+        except Exception as exc:
+            self._log_hwp_replace(f"fragment debug dump failed: {type(exc).__name__}: {exc}")
+
+
+    def _dump_hwp_selection_debug(
+        self,
+        hwp,
+        document_path: Path,
+        raw_source_text: str,
+        live_selection_text: str,
+        extracted_hwpx_text: str,
+        replacement_text: str,
+        work_dir: Path,
+        selection_pos: dict | None = None,
+    ) -> Path:
+        """Write a debuggable snapshot of the selected HWPX block without changing apply logic."""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        dump_root = _LOG_DIR / "selected_block_dump"
+        dump_dir = dump_root / timestamp
+        latest_dir = dump_root / "latest"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        def write_text(path: Path, value: str) -> None:
+            path.write_text(str(value or ""), encoding="utf-8", errors="replace")
+
+        def codepoints(value: str, limit: int = 400) -> str:
+            chars = []
+            for index, char in enumerate(str(value or "")[:limit]):
+                display = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\v": "\\v", "\f": "\\f"}.get(char, char)
+                chars.append(f"{index:04d}: U+{ord(char):04X} {display!r}")
+            return "\n".join(chars)
+
+        try:
+            shutil.copy2(document_path, dump_dir / "selected_block.hwpx")
+        except Exception as exc:
+            self._log_hwp_replace(f"debug dump copy hwpx failed: {type(exc).__name__}: {exc}")
+
+        raw_gettext = ""
+        getter = getattr(hwp, "GetTextFile", None)
+        if callable(getter):
+            try:
+                raw_gettext = str(getter("TEXT", "saveblock") or "")
+            except Exception as exc:
+                raw_gettext = f"<GetTextFile TEXT saveblock failed: {type(exc).__name__}: {exc}>"
+
+        normalized_raw = self._normalize_hwp_source_text(raw_source_text).strip()
+        normalized_live = self._normalize_hwp_source_text(live_selection_text).strip()
+        normalized_gettext = self._normalize_hwp_source_text(raw_gettext).strip()
+        normalized_hwpx = self._normalize_hwp_source_text(extracted_hwpx_text).strip()
+
+        write_text(dump_dir / "selected_text_from_style_info.txt", raw_source_text)
+        write_text(dump_dir / "selected_text_from_hwp_gettext_raw.txt", raw_gettext)
+        write_text(dump_dir / "selected_text_from_hwp_gettext_normalized.txt", normalized_gettext)
+        write_text(dump_dir / "live_selection_text_normalized.txt", normalized_live)
+        write_text(dump_dir / "extracted_text_from_hwpx.txt", extracted_hwpx_text)
+        write_text(dump_dir / "extracted_text_from_hwpx_normalized.txt", normalized_hwpx)
+        write_text(dump_dir / "replacement_text.txt", replacement_text)
+        write_text(dump_dir / "selection_position.json", self._json_dumps(selection_pos or {}))
+        write_text(dump_dir / "codepoints_gettext_raw.txt", codepoints(raw_gettext))
+        write_text(dump_dir / "codepoints_hwpx_text.txt", codepoints(extracted_hwpx_text))
+
+        info = [
+            f"timestamp={timestamp}",
+            f"work_dir={work_dir}",
+            f"document_path={document_path}",
+            f"raw_source_len={len(raw_source_text or '')}",
+            f"live_selection_len={len(live_selection_text or '')}",
+            f"raw_gettext_len={len(raw_gettext or '')}",
+            f"extracted_hwpx_len={len(extracted_hwpx_text or '')}",
+            f"replacement_len={len(replacement_text or '')}",
+            f"selection_pos={selection_pos or {}}",
+            f"experimental_rebuilder_enabled={self._hwp_experimental_rebuilder_enabled()}",
+            f"experimental_rebuilder_env={os.environ.get('WA_HWP_EXPERIMENTAL_REBUILDER', '')}",
+            f"normalized_gettext_equals_hwpx={normalized_gettext == normalized_hwpx}",
+            f"normalized_live_equals_hwpx={normalized_live == normalized_hwpx}",
+            f"normalized_style_equals_hwpx={normalized_raw == normalized_hwpx}",
+            f"gettext_in_hwpx={bool(normalized_gettext and normalized_gettext in normalized_hwpx)}",
+            f"live_in_hwpx={bool(normalized_live and normalized_live in normalized_hwpx)}",
+            f"style_in_hwpx={bool(normalized_raw and normalized_raw in normalized_hwpx)}",
+        ]
+        write_text(dump_dir / "debug_info.txt", "\n".join(info) + "\n")
+
+        try:
+            with zipfile.ZipFile(document_path, "r") as archive:
+                for name in archive.namelist():
+                    lower = name.lower()
+                    if lower.startswith("contents/section") and lower.endswith(".xml"):
+                        safe_name = name.replace("/", "_").replace("\\", "_")
+                        (dump_dir / safe_name).write_bytes(archive.read(name))
+        except Exception as exc:
+            self._log_hwp_replace(f"debug dump extract xml failed: {type(exc).__name__}: {exc}")
+
+        try:
+            if latest_dir.exists():
+                shutil.rmtree(latest_dir)
+            shutil.copytree(dump_dir, latest_dir)
+        except Exception as exc:
+            self._log_hwp_replace(f"debug dump latest copy failed: {type(exc).__name__}: {exc}")
+
+        self._log_hwp_replace(f"debug dump written: {dump_dir}")
+        return dump_dir
+
+    def _write_hwp_hwpx_match_debug(
+        self,
+        work_dir: Path,
+        index: int,
+        source_text: str,
+        matches,
+        preferred_start_paragraph: int | None,
+        preferred_start_offset: int | None,
+        use_positioned_match: bool,
+    ) -> None:
+        try:
+            data = {
+                "fragment_index": index,
+                "source_text": source_text,
+                "source_length": len(source_text or ""),
+                "preferred_start_paragraph": preferred_start_paragraph,
+                "preferred_start_offset": preferred_start_offset,
+                "use_positioned_match": use_positioned_match,
+                "match_count": len(matches),
+                "matches": [
+                    {
+                        "section_path": getattr(match, "section_path", ""),
+                        "start": getattr(match, "start", -1),
+                        "end": getattr(match, "end", -1),
+                        "start_paragraph": getattr(match, "start_paragraph", -1),
+                        "end_paragraph": getattr(match, "end_paragraph", -1),
+                        "start_paragraph_offset": getattr(match, "start_paragraph_offset", -1),
+                        "end_paragraph_offset": getattr(match, "end_paragraph_offset", -1),
+                    }
+                    for match in matches
+                ],
+            }
+            (work_dir / f"fragment.{index:03d}.matches.json").write_text(
+                self._json_dumps(data),
+                encoding="utf-8",
+            )
+            latest_dir = _LOG_DIR / "selected_block_dump" / "latest"
+            if latest_dir.exists():
+                (latest_dir / f"fragment.{index:03d}.matches.json").write_text(
+                    self._json_dumps(data),
+                    encoding="utf-8",
+                )
+        except Exception as exc:
+            self._log_hwp_replace(f"HWPX match debug write failed: {type(exc).__name__}: {exc}")
+
+    def _json_dumps(self, value) -> str:
+        try:
+            import json
+
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        except Exception:
+            return repr(value)
+
+    def _read_hwp_selection_plain_text(self, hwp) -> str:
+        getter = getattr(hwp, "GetTextFile", None)
+        if not callable(getter):
+            return ""
+        try:
+            return self._normalize_hwp_source_text(str(getter("TEXT", "saveblock") or "")).strip()
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP selection TEXT read failed: {type(exc).__name__}: {exc}")
+            return ""
+
+    def _read_hwp_selection_position(self, hwp) -> dict:
+        getter = getattr(hwp, "GetSelectedPos", None)
+        if not callable(getter):
+            return {}
+        try:
+            value = getter()
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP GetSelectedPos failed: {type(exc).__name__}: {exc}")
+            return {}
+        parsed = self._parse_hwp_selected_pos(value)
+        self._log_hwp_replace(f"HWP GetSelectedPos value={value!r} parsed={parsed!r}")
+        return parsed
+
+    def _parse_hwp_selected_pos(self, value) -> dict:
+        if not isinstance(value, tuple) or len(value) < 7 or not bool(value[0]):
+            return {}
+        try:
+            return {
+                "start_list": int(value[1]),
+                "start_para": int(value[2]),
+                "start_pos": int(value[3]),
+                "end_list": int(value[4]),
+                "end_para": int(value[5]),
+                "end_pos": int(value[6]),
+                "raw": [item for item in value],
+            }
+        except Exception:
+            return {"raw": [item for item in value]}
+
+    def _source_for_saved_hwpx_document(self, source_text: str, document_text: str) -> str:
+        source = self._normalize_hwp_source_text(source_text).strip()
+        document = self._normalize_hwp_source_text(document_text).strip()
+        if not source:
+            raise RuntimeError("한글에서 드래그 선택된 원문을 찾지 못했습니다.")
+        if source == document:
+            self._log_hwp_replace("HWPX source equals saved document; treating saved file as selection/all-selection block")
+            return source
+        if source in document:
+            return source
+
+        compact_source = self._compact_hwp_match_text(source)
+        compact_document = self._compact_hwp_match_text(document)
+        if compact_source == compact_document:
+            self._log_hwp_replace("HWPX compact source equals saved document; using saved HWPX text as selection block")
+            return document
+
+        nobreak_source = self._linebreak_insensitive_text(source)
+        nobreak_document = self._linebreak_insensitive_text(document)
+        if nobreak_source and nobreak_source == nobreak_document:
+            self._log_hwp_replace("HWPX linebreak-insensitive source equals saved document; using saved HWPX text")
+            return document
+
+        if nobreak_source and nobreak_source in nobreak_document and len(document) <= max(len(source) * 3, len(source) + 80):
+            self._log_hwp_replace("HWPX source appears to be selected block with soft line breaks; using saved HWPX text")
+            return document
+
+        self._log_hwp_replace(
+            f"HWPX source requires flexible XML match source={source[:160]!r} document={document[:160]!r}"
+        )
+        return source
+
+    def _normalize_hwp_source_text(self, text: str) -> str:
+        return (
+            html.unescape(str(text or ""))
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\v", "\n")
+            .replace("\f", "\n")
+            .replace("\u2028", "\n")
+            .replace("\u2029", "\n")
+        )
+
+    def _compact_hwp_match_text(self, text: str) -> str:
+        lines = [line.strip() for line in self._normalize_hwp_source_text(text).split("\n")]
+        return "\n".join(line for line in lines if line)
+
+    def _linebreak_insensitive_text(self, text: str) -> str:
+        return "".join(self._compact_hwp_match_text(text).split("\n"))
+
+    def _save_hwp_document_as_hwpx(
+        self,
+        hwp,
+        path: Path,
+        expected_text: str = "",
+        prefer_full_document: bool = False,
+    ) -> bool:
+        """Save the current HWP selection as HWPX.
+
+        HWP 2018 may export the whole document for one SaveAs option even when
+        text is selected.  Try all known options and choose the smallest HWPX
+        whose extracted text matches the live selected text.  This prevents
+        inserting the entire document into the dragged selection.
+        """
+        options = ("", "saveblock", "selection") if prefer_full_document else ("selection", "saveblock", "")
+        expected_key = self._hwp_compare_key(expected_text or "")
+        attempts: list[tuple[int, str, Path, int, bool, int, int, bool]] = []
+        for index, option in enumerate(options):
+            candidate_path = path.with_name(f"{path.stem}.candidate{index}{path.suffix}")
+            try:
+                if candidate_path.exists():
+                    candidate_path.unlink()
+                result = hwp.SaveAs(str(candidate_path), "HWPX", option)
+                if not candidate_path.exists() or candidate_path.stat().st_size <= 0:
+                    self._log_hwp_replace(
+                        f"HWPX SaveAs option={option!r} produced no file result={result!r}"
+                    )
+                    continue
+                try:
+                    text = extract_hwpx_text(candidate_path)
+                except Exception as text_exc:
+                    self._log_hwp_replace(
+                        f"HWPX SaveAs option={option!r} text extract failed: {type(text_exc).__name__}: {text_exc}"
+                    )
+                    text = ""
+                text_key = self._hwp_compare_key(text)
+                exact_or_contained = bool(expected_key and text_key and (expected_key in text_key or text_key in expected_key))
+                positioned_match_count = self._hwp_positioned_match_count(
+                    candidate_path,
+                    expected_text,
+                    getattr(self, "_current_hwp_selection_pos", {}),
+                )
+                position_fallback = self._hwp_position_fallback_available(
+                    candidate_path,
+                    expected_text,
+                    getattr(self, "_current_hwp_selection_pos", {}),
+                )
+                matches = bool(
+                    exact_or_contained
+                    or (option == "" and prefer_full_document and (positioned_match_count >= 1 or position_fallback))
+                )
+                match_count = self._hwp_hwpx_match_count(candidate_path, expected_text) if exact_or_contained else 0
+                attempts.append((
+                    len(text_key),
+                    option,
+                    candidate_path,
+                    index,
+                    matches,
+                    match_count,
+                    positioned_match_count,
+                    position_fallback,
+                ))
+                self._log_hwp_replace(
+                    f"HWPX SaveAs candidate={index} option={option!r} "
+                    f"result={result!r} text_key_len={len(text_key)} "
+                    f"matches_selection={matches} match_count={match_count} "
+                    f"positioned_match_count={positioned_match_count} "
+                    f"position_fallback={position_fallback}"
+                )
+            except Exception as exc:
+                self._log_hwp_replace(f"HWPX SaveAs option={option!r} failed: {type(exc).__name__}: {exc}")
+
+        if not attempts:
+            return False
+
+        if prefer_full_document:
+            full_unique = [
+                item for item in attempts
+                if item[1] == "" and item[4] and (
+                    item[5] == 1
+                    or item[6] >= 1
+                    or item[7]
+                )
+            ]
+            if full_unique:
+                chosen = full_unique[0]
+            else:
+                chosen = None
+        else:
+            chosen = None
+
+        matching = [item for item in attempts if item[4]]
+        if matching:
+            # Prefer the smallest matching export unless a unique full-document
+            # export was already selected above.
+            chosen = chosen or min(matching, key=lambda item: item[0])
+        elif chosen is None:
+            # Fallback: prefer the smallest non-empty export rather than the full document.
+            chosen = min(attempts, key=lambda item: item[0])
+
+        _, option, chosen_path, index, matches, match_count, positioned_match_count, position_fallback = chosen
+        shutil.copy2(chosen_path, path)
+        self._log_hwp_replace(
+            f"HWPX document saved via selected candidate={index} option={option!r} "
+            f"matches_selection={matches} match_count={match_count} "
+            f"positioned_match_count={positioned_match_count} "
+            f"position_fallback={position_fallback} "
+            f"prefer_full_document={prefer_full_document} path={path!s}"
+        )
+        return path.exists() and path.stat().st_size > 0
+
+    def _hwp_hwpx_match_count(self, document_path: Path, expected_text: str) -> int:
+        return len(self._hwp_hwpx_matches(document_path, expected_text))
+
+    def _hwp_hwpx_matches(self, document_path: Path, expected_text: str):
+        try:
+            return find_hwpx_text_matches(document_path, expected_text)
+        except Exception as exc:
+            self._log_hwp_replace(f"HWPX match count failed: {type(exc).__name__}: {exc}")
+            return []
+
+    def _hwp_positioned_match_count(self, document_path: Path, expected_text: str, selection_pos: dict) -> int:
+        start_paragraph = self._hwp_selection_start_paragraph(selection_pos)
+        if start_paragraph is None:
+            return 0
+        start_offset = self._hwp_selection_start_offset(selection_pos)
+        return self._hwp_positioned_matches_count(
+            self._hwp_hwpx_matches(document_path, expected_text),
+            start_paragraph,
+            start_offset,
+        )
+
+    def _hwp_position_fallback_available(self, document_path: Path, expected_text: str, selection_pos: dict) -> bool:
+        start_paragraph = self._hwp_selection_start_paragraph(selection_pos)
+        if start_paragraph is None:
+            return False
+        try:
+            return has_hwpx_position_fallback_match(
+                document_path,
+                expected_text,
+                preferred_start_paragraph=start_paragraph,
+                preferred_start_offset=self._hwp_selection_start_offset(selection_pos),
+                preferred_end_paragraph=self._hwp_selection_end_paragraph(selection_pos),
+                preferred_end_offset=self._hwp_selection_end_offset(selection_pos),
+            )
+        except Exception as exc:
+            self._log_hwp_replace(f"HWPX position fallback check failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def _hwp_matches_at_paragraph_count(self, matches, start_paragraph: int) -> int:
+        return sum(1 for match in matches if getattr(match, "start_paragraph", -1) == start_paragraph)
+
+    def _hwp_positioned_matches_count(
+        self,
+        matches,
+        start_paragraph: int,
+        start_offset: int | None,
+    ) -> int:
+        if start_offset is not None:
+            exact = [
+                match for match in matches
+                if getattr(match, "start_paragraph", -1) == start_paragraph
+                and getattr(match, "start_paragraph_offset", -1) == start_offset
+            ]
+            if exact:
+                return len(exact)
+        return self._hwp_matches_at_paragraph_count(matches, start_paragraph)
+
+    def _hwp_selection_start_paragraph(self, selection_pos: dict) -> int | None:
+        try:
+            value = int((selection_pos or {}).get("start_para"))
+        except Exception:
+            return None
+        return value if value >= 0 else None
+
+    def _hwp_selection_start_offset(self, selection_pos: dict) -> int | None:
+        try:
+            value = int((selection_pos or {}).get("start_pos"))
+        except Exception:
+            return None
+        return value if value >= 0 else None
+
+    def _hwp_selection_end_paragraph(self, selection_pos: dict) -> int | None:
+        try:
+            value = int((selection_pos or {}).get("end_para"))
+        except Exception:
+            return None
+        return value if value >= 0 else None
+
+    def _hwp_selection_end_offset(self, selection_pos: dict) -> int | None:
+        try:
+            value = int((selection_pos or {}).get("end_pos"))
+        except Exception:
+            return None
+        return value if value >= 0 else None
+
+    def _delete_hwp_selection(self, hwp) -> None:
+        for action in ("Delete", "DeleteBack", "Erase"):
+            try:
+                hwp.Run(action)
+                self._log_hwp_replace(f"HWP selection deleted via Run({action!r})")
+                return
+            except Exception as exc:
+                self._log_hwp_replace(f"HWP delete action {action!r} failed: {type(exc).__name__}: {exc}")
+        raise RuntimeError("Could not delete current HWP selection.")
+
+    def _insert_hwpx_file(self, hwp, path: Path) -> bool:
+        try:
+            hwp.HAction.GetDefault("InsertFile", hwp.HParameterSet.HInsertFile.HSet)
+            params = hwp.HParameterSet.HInsertFile
+            for name in ("FileName", "filename", "FilePath", "FullName"):
+                try:
+                    setattr(params, name, str(path))
+                except Exception:
+                    pass
+            for name, value in (
+                ("KeepSection", 0),
+                ("KeepCharshape", 1),
+                ("KeepParashape", 1),
+                ("KeepStyle", 1),
+            ):
+                try:
+                    setattr(params, name, value)
+                except Exception:
+                    pass
+            result = hwp.HAction.Execute("InsertFile", params.HSet)
+            self._log_hwp_replace(f"HWP InsertFile result={result!r} path={path!s}")
+            return bool(result is None or result)
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP InsertFile HAction failed: {type(exc).__name__}: {exc}")
+
+        try:
+            hwp.InsertFile(str(path), "HWPX", "KeepSection:0;KeepCharshape:1;KeepParashape:1;KeepStyle:1")
+            self._log_hwp_replace(f"HWP InsertFile method succeeded path={path!s}")
+            return True
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP InsertFile method failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def _insert_hwpml_file(self, hwp, path: Path) -> bool:
+        try:
+            hwp.HAction.GetDefault("InsertFile", hwp.HParameterSet.HInsertFile.HSet)
+            params = hwp.HParameterSet.HInsertFile
+            for name in ("FileName", "filename", "FilePath", "FullName"):
+                try:
+                    setattr(params, name, str(path))
+                except Exception:
+                    pass
+            result = hwp.HAction.Execute("InsertFile", params.HSet)
+            self._log_hwp_replace(f"HWP HWPML InsertFile result={result!r} path={path!s}")
+            return bool(result is None or result)
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP HWPML InsertFile HAction failed: {type(exc).__name__}: {exc}")
+
+        try:
+            hwp.InsertFile(str(path))
+            self._log_hwp_replace(f"HWP HWPML InsertFile method succeeded path={path!s}")
+            return True
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP HWPML InsertFile method failed: {type(exc).__name__}: {exc}")
+            return False
 
     def _active_hwp_object(self, window_handle: int | None = None):
         import win32com.client as win32
@@ -540,12 +1429,15 @@ class OutputApplier:
             lowered = str(display_name).lower()
             if "hwp" not in lowered and "hancom" not in lowered and "hword" not in lowered:
                 continue
+            self._log_hwp_replace(f"HWP ROT entry={display_name!r}")
             try:
                 hwp = self._coerce_hwp_object(rot.GetObject(moniker))
                 if hwp is not None:
                     self._log_hwp_replace(f"HWP COM object resolved via ROT entry={display_name!r}")
                     return hwp
-            except Exception:
+                self._log_hwp_replace(f"HWP ROT entry unusable={display_name!r}")
+            except Exception as exc:
+                self._log_hwp_replace(f"HWP ROT entry failed={display_name!r}: {type(exc).__name__}: {exc}")
                 continue
         return None
 
@@ -555,14 +1447,14 @@ class OutputApplier:
         try:
             import win32com.client as win32
             from ctypes import POINTER, byref, c_long, c_void_p
-            from ctypes.wintypes import HWND, HRESULT
+            from ctypes.wintypes import HWND
 
             oleacc = ctypes.oledll.oleacc
             iid_buffer = ctypes.create_string_buffer(bytes(pythoncom.IID_IDispatch))
             pdisp = c_void_p()
             accessible_object_from_window = oleacc.AccessibleObjectFromWindow
             accessible_object_from_window.argtypes = [HWND, c_long, c_void_p, POINTER(c_void_p)]
-            accessible_object_from_window.restype = HRESULT
+            accessible_object_from_window.restype = c_long
             result = accessible_object_from_window(
                 HWND(int(hwnd)),
                 c_long(-16),  # OBJID_NATIVEOM
@@ -588,6 +1480,7 @@ class OutputApplier:
         for candidate in self._hwp_dispatch_candidates(obj):
             if all(hasattr(candidate, name) for name in required):
                 return candidate
+        self._log_hwp_replace(f"HWP object coerce failed type={type(obj)}")
         return None
 
     def _hwp_dispatch_candidates(self, obj):
@@ -601,6 +1494,10 @@ class OutputApplier:
             candidates.append(win32.Dispatch(obj))
         except Exception:
             pass
+        try:
+            candidates.append(win32.dynamic.Dispatch(obj))
+        except Exception:
+            pass
 
         for source in (obj, getattr(obj, "_oleobj_", None)):
             if source is None:
@@ -611,6 +1508,10 @@ class OutputApplier:
             for iid in self._hwp_query_interface_iids():
                 try:
                     candidates.append(win32.Dispatch(query(iid)))
+                except Exception:
+                    pass
+                try:
+                    candidates.append(win32.dynamic.Dispatch(query(iid)))
                 except Exception:
                     pass
 
@@ -1653,4 +2554,3 @@ class OutputApplier:
             return Application, send_keys
         except Exception:
             return None, None
-

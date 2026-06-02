@@ -1349,6 +1349,7 @@ class ResultPanel(QWidget):
             }}
             QTabBar::tab:selected {{
                 background: {colors["tab_selected"]};
+                color: {colors["text"]};
             }}
             QTextEdit {{
                 background: {colors["editor_bg"]};
